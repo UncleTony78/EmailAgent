@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from crewai import Crew, Task
 from agents import create_jared_crew
+from security import SecureEmailHandler, EmailWorkflowOrchestrator, EmailAgentTelemetry
 import uvicorn
 import os
 from google_auth_oauthlib.flow import Flow
@@ -13,6 +14,11 @@ load_dotenv()
 
 app = FastAPI(title="Jared Email Assistant API")
 jared_crew = create_jared_crew()
+secure_handler = SecureEmailHandler()
+telemetry = EmailAgentTelemetry()
+
+# Initialize workflow orchestrator (we'll add vector store integration later)
+workflow = EmailWorkflowOrchestrator(jared_crew, None)
 
 # OAuth2 Configuration
 CLIENT_SECRETS_FILE = "client_secrets.json"
@@ -32,6 +38,8 @@ class EmailQuery(BaseModel):
 async def read_emails(query: EmailQuery):
     """Read and analyze emails"""
     try:
+        telemetry.log_email_interaction("read_emails", {"query": query.dict()})
+        
         # Create crew and tasks
         crew = Crew(
             agents=[jared_crew['reader'], jared_crew['analyzer']],
@@ -48,44 +56,63 @@ async def read_emails(query: EmailQuery):
         )
         
         result = crew.kickoff()
+        
+        # Encrypt sensitive data before returning
+        if result.get("sensitive_content"):
+            result["sensitive_content"] = secure_handler.encrypt_sensitive_data(
+                result["sensitive_content"]
+            )
+        
         return {"result": result}
     except Exception as e:
+        telemetry.log_error("Failed to read emails", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/send-email")
 async def send_email(email: EmailRequest):
     """Compose and send an email"""
     try:
-        # Create crew and task
+        telemetry.log_email_interaction("send_email", {"to": email.to, "subject": email.subject})
+        
+        # Process email through workflow
+        workflow_result = await workflow.process_incoming_email({
+            "to": email.to,
+            "subject": email.subject,
+            "content": email.body
+        })
+        
+        # Create crew and tasks
         crew = Crew(
             agents=[jared_crew['composer']],
             tasks=[
                 Task(
-                    description=f"Compose and send email to {email.to} with subject: {email.subject} and body: {email.body}",
+                    description=f"Send email to {email.to} with subject: {email.subject}",
                     agent=jared_crew['composer']
                 )
             ]
         )
         
         result = crew.kickoff()
-        return {"result": result}
+        return {
+            "result": result,
+            "workflow": workflow_result
+        }
     except Exception as e:
+        telemetry.log_error("Failed to send email", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/analyze-conversation")
 async def analyze_conversation(query: EmailQuery):
     """Analyze email conversations"""
     try:
+        telemetry.log_email_interaction("analyze_conversation", {"query": query.dict()})
+        
         # Create crew and tasks
         crew = Crew(
-            agents=[jared_crew['reader'], jared_crew['analyzer']],
+            agents=[jared_crew['analyzer']],
             tasks=[
                 Task(
-                    description=f"Read email conversation thread with query: {query.query}",
-                    agent=jared_crew['reader']
-                ),
-                Task(
-                    description="Analyze the conversation and provide comprehensive insights",
+                    description=f"Analyze conversation with query: {query.query}",
                     agent=jared_crew['analyzer']
                 )
             ]
@@ -94,6 +121,7 @@ async def analyze_conversation(query: EmailQuery):
         result = crew.kickoff()
         return {"result": result}
     except Exception as e:
+        telemetry.log_error("Failed to analyze conversation", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/auth/callback")
